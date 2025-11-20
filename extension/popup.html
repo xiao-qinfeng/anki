@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 320px; font-family: "Microsoft YaHei", sans-serif; padding: 15px; }
+    h2 { margin-top: 0; color: #333; font-size: 16px; border-bottom: 2px solid #4CAF50; padding-bottom: 10px;}
+    label { display: block; margin-top: 12px; font-size: 12px; font-weight: bold; color: #555; }
+    input, select { width: 100%; margin-top: 5px; padding: 8px; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
+    input:focus { border-color: #4CAF50; outline: none; }
+    
+    button { 
+      width: 100%; margin-top: 20px; padding: 12px; 
+      background: #4CAF50; color: white; border: none; border-radius: 4px;
+      cursor: pointer; font-weight: bold; font-size: 14px;
+      transition: background 0.3s;
+    }
+    button:hover { background: #45a049; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    
+    #status { margin-top: 15px; font-size: 12px; color: #666; word-break: break-all; line-height: 1.4; background: #f9f9f9; padding: 10px; border-radius: 4px;}
+    
+    .settings { margin-top: 20px; border-top: 1px solid #eee; padding-top: 10px; }
+    summary { cursor: pointer; font-size: 12px; color: #888; }
+  </style>
+</head>
+<body>
+  <h2>⛏️ KnowledgeMiner</h2>
+
+  <!-- 这里的 value 已经改为您的默认值 -->
+  <label>Anki 牌组名称 (Deck)</label>
+  <input type="text" id="deckName" value="inbox" placeholder="例如: inbox">
+
+  <button id="runBtn">🚀 生成并导入 Anki</button>
+  <div id="status">准备就绪</div>
+
+  <div class="settings">
+    <details open> <!-- 默认展开，方便您第一次输入 Key -->
+      <summary>⚙️ 设置 (API & 模板)</summary>
+      
+      <label>API Key (自动保存)</label>
+      <input type="password" id="apiKey" placeholder="sk-...">
+      
+      <label>笔记类型/模板 (Note Type)</label>
+      <input type="text" id="noteType" value="问答题">
+      
+      <label>Base URL</label>
+      <input type="text" id="baseUrl" value="https://api.deepseek.com">
+      <label>Model</label>
+      <input type="text" id="model" value="deepseek-chat">
+    </details>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

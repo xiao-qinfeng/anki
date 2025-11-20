@@ -1,0 +1,5 @@
+streamlit
+openai
+trafilatura
+pdfplumber
+pandas

@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "KnowledgeMiner: 一鍵 Anki",
+  "version": "1.0",
+  "description": "AI 摘要網頁並直接匯入 Anki",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://api.deepseek.com/*",
+    "https://api.openai.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
