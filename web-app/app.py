@@ -1,245 +1,344 @@
 import streamlit as st
-import trafilatura
-import pdfplumber
-from openai import OpenAI
-import pandas as pd
 import json
+import genanki
+import random
+import re
+import time
+import os
+import requests
+import concurrent.futures
+import trafilatura
+from datetime import datetime
+from openai import OpenAI
+from youtube_transcript_api import YouTubeTranscriptApi
+from pypdf import PdfReader
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
 
-# === 1. 页面基础设置 ===
-st.set_page_config(
-    page_title="KnowledgeMiner - 智能知识卡片生成器",
-    page_icon="⛏️",
-    layout="wide"
-)
+# === UI 配置 ===
+st.set_page_config(page_title="KnowledgeMiner Pro", layout="wide")
+DATA_DIR = "data"
+if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
 
-# 初始化 Session State (防止交互时数据丢失)
-if "generated_df" not in st.session_state:
-    st.session_state.generated_df = None
-if "raw_text_cache" not in st.session_state:
-    st.session_state.raw_text_cache = ""
+# === 0. 状态管理 ===
+if 'global_cards' not in st.session_state: st.session_state.global_cards = []
+if 'analysis_result' not in st.session_state: st.session_state.analysis_result = ""
+if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0
+if 'source_name' not in st.session_state: st.session_state.source_name = "未命名笔记"
 
-st.title("⛏️ KnowledgeMiner: 你的知识炼金术师")
-st.markdown("支持文章、PDF电子书、以及 **AI对话记录** 批量转为 Anki 卡片")
-
-# === 2. 侧边栏：设置面板 ===
-with st.sidebar:
-    st.header("⚙️ 参数设置")
-    
-    # API 配置
-    api_key = st.text_input("API Key (DeepSeek/OpenAI)", type="password", help="推荐使用 DeepSeek，性价比极高")
-    base_url = st.text_input("Base URL", value="https://api.deepseek.com", help="DeepSeek 请填入 https://api.deepseek.com")
-    model_name = st.text_input("模型名称", value="deepseek-chat")
-    
-    st.markdown("---")
-    st.subheader("🎨 卡片生成模式")
-    
-    # 核心功能：模式选择器
-    mode_selection = st.radio(
-        "选择你的素材类型：",
-        ("🤖 AI对话/聊天记录 (推荐)", "📄 概念解释/理论文章", "🔤 英语单词/语言学习"),
-        index=0
-    )
-
-    # 根据选择，自动切换 Prompt
-    if mode_selection == "🤖 AI对话/聊天记录 (推荐)":
-        default_prompt = """
-        你是一个专业的知识萃取专家。用户将提供一段“人类与AI”的对话记录。
-        
-        你的任务是：
-        1. **降噪**：忽略所有的客套话（如“你好”、“谢谢”、“明白了”、“请问”等）。
-        2. **提炼**：识别用户感到困惑的“核心问题”和AI提供的“关键解答”。
-        3. **压缩**：将啰嗦的解释压缩为简练的笔记（Bullet points）。
-        4. **格式**：输出严格的 JSON 列表。
-
-        JSON 字段要求：
-        - Front: 用户原本想问的核心概念或问题。
-        - Back: 经过总结的答案（支持 HTML 换行 <br>）。
-        - Tags: 自动生成标签。
-
-        示例：
-        [{"Front": "Python中列表和元组的区别？", "Back": "1. 列表(List)是可变的 [...]<br>2. 元组(Tuple)是不可变的 [...]", "Tags": "Python 数据结构"}]
-        """
-        
-    elif mode_selection == "📄 概念解释/理论文章":
-        default_prompt = """
-        你是一个Anki制卡专家。请阅读文章，提取核心知识点。
-        
-        任务要求：
-        1. 提取文中的专有名词、理论或反直觉的观点。
-        2. 解释要通俗易懂，多用比喻。
-        3. 严格输出 JSON 列表。
-        
-        JSON 字段要求：
-        - Front: 概念名称或问题。
-        - Back: 详细解释。
-        - Tags: 标签。
-        """
-        
-    else: # 英语学习模式
-        default_prompt = """
-        你是一个语言学习助手。请提取文中的生词或短语。
-        
-        JSON 字段要求：
-        - Front: 英文单词/短语。
-        - Back: 中文释义 + 一个双语例句（用 <br> 换行）。
-        - Tags: 标签（如 #商务英语 #动词）。
-        """
-
-    system_prompt = st.text_area("系统提示词 (System Prompt)", value=default_prompt, height=250)
-    
-    # 添加重置按钮
-    if st.button("🗑️ 清空当前结果"):
-        st.session_state.generated_df = None
-        st.rerun()
-
-
-# === 3. 核心功能函数 ===
-
+# === 1. 提取层 ===
 def extract_url(url):
-    """从网址抓取正文"""
-    downloaded = trafilatura.fetch_url(url)
-    if downloaded is None:
-        raise Exception("无法连接到该网址，请检查链接是否有效。")
-    return trafilatura.extract(downloaded)
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded: raise ValueError("连接失败")
+        text = trafilatura.extract(downloaded)
+        if not text: raise ValueError("无正文")
+        return text
+    except Exception as e: raise ValueError(f"解析失败: {e}")
 
-def extract_pdf(uploaded_file):
-    """解析 PDF 文本"""
+def extract_youtube(url, proxy=None):
+    pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
+    match = re.search(pattern, url)
+    if not match: raise ValueError("无效链接")
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(match.group(1), languages=['zh-Hans','en'], proxies=proxies)
+        return " ".join([t['text'] for t in transcript])
+    except Exception as e:
+        raise ValueError(f"YouTube 抓取失败: {e}")
+
+def extract_audio(file_obj, api_key, base_url):
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    return client.audio.transcriptions.create(model="whisper-1", file=file_obj, response_format="text")
+
+def extract_file(file):
     text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
-        # 考虑到Token限制，目前仅读取前 10 页
-        for page in pdf.pages[:10]: 
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+    try:
+        if file.name.endswith(".pdf"):
+            reader = PdfReader(file)
+            for page in reader.pages: text += page.extract_text() + "\n"
+        elif file.name.endswith(".epub"):
+            book = epub.read_epub(file)
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    soup = BeautifulSoup(item.get_content(), 'html.parser')
+                    text += soup.get_text() + "\n"
+        elif file.name.endswith((".txt", ".md")):
+            text = file.read().decode("utf-8")
+    except Exception as e: raise ValueError(f"解析错误: {e}")
     return text
 
-def generate_cards(text, api_key, base_url, model):
-    """调用 AI 生成卡片"""
+# === 2. AI 核心层 (V8.3 升级：自动重试与限流) ===
+PROMPTS = {
+    "💡 知识卡片提取": {"type": "json", "system": "分析文本，提取核心知识点。输出 JSON: Front, Back, Tags"},
+    "🧠 填空记忆 (Cloze)": {"type": "json", "system": "转化为 Anki 挖空题。输出 JSON: Front (含 {{c1::}}), Back, Tags"},
+    "✍️ 写作风格拆解": {"type": "text", "system": "拆解写作风格、结构、亮点。Markdown输出。"},
+    "🎬 短视频文案": {"type": "text", "system": "改编为短视频脚本。Markdown输出。"},
+    "🌳 思维导图": {"type": "text", "system": "输出 Mermaid 代码。"}
+}
+
+def call_ai_single(text_chunk, api_key, base_url, model, cfg):
+    """包含动态重试机制的 AI 调用函数"""
     client = OpenAI(api_key=api_key, base_url=base_url)
-    
-    truncated_text = text[:8000] 
-    
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请处理以下内容：\n\n{truncated_text}"}
-        ],
-        temperature=0.1,
-        response_format={ "type": "json_object" } 
-    )
-    return response.choices[0].message.content
+    max_retries = 5  # 最大重试次数
+    base_wait_time = 5  # 初始等待时间（秒）
 
+    for attempt in range(max_retries):
+        try:
+            params = {
+                "model": model,
+                "messages": [{"role": "system", "content": cfg["system"]}, {"role": "user", "content": text_chunk}],
+                "temperature": 0.3
+            }
+            if cfg["type"] == "json":
+                params["response_format"] = {"type": "json_object"}
 
-# === 4. 主界面布局 ===
+            resp = client.chat.completions.create(**params)
+            content = resp.choices[0].message.content
 
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("📥 第一步：导入素材")
-    tab_text, tab_pdf, tab_url = st.tabs(["📝 粘贴文本/对话", "📄 上传 PDF", "🔗 解析 URL"])
-    
-    raw_text = ""
-    
-    # 文本/对话输入框
-    with tab_text:
-        st.info("💡 提示：如果是对话记录，直接全选复制，粘贴到这里即可。")
-        text_input = st.text_area("在此处粘贴", height=300, placeholder="User: 什么是递归？\nAI: 递归就是...")
-        if text_input:
-            raw_text = text_input
-
-    # PDF 上传框
-    with tab_pdf:
-        uploaded_pdf = st.file_uploader("上传 PDF 文件", type="pdf")
-        if uploaded_pdf:
-            with st.spinner("正在读取 PDF..."):
+            if cfg["type"] == "json":
+                content_clean = content.replace("```json", "").replace("```", "").strip()
                 try:
-                    raw_text = extract_pdf(uploaded_pdf)
-                    st.success(f"读取成功！共提取 {len(raw_text)} 个字符。")
-                except Exception as e:
-                    st.error(f"PDF 读取失败: {e}")
+                    data = json.loads(content_clean)
+                except json.JSONDecodeError as e:
+                    return [{
+                        "Front": "⚠️ JSON 解析失败",
+                        "Back": f"AI 返回格式错误: {str(e)} | 原始内容: {content_clean[:200]}",
+                        "Tags": ["Error"]
+                    }]
 
-    # URL 输入框
-    with tab_url:
-        url_input = st.text_input("输入文章链接")
-        if url_input:
-            with st.spinner("正在抓取网页..."):
-                try:
-                    raw_text = extract_url(url_input)
-                    st.success("抓取成功！")
-                except Exception as e:
-                    st.error(f"抓取失败: {e}")
+                if isinstance(data, dict):
+                    for k in ["cards", "items", "flashcards"]:
+                        if k in data:
+                            return data[k]
+                return data if isinstance(data, list) else []
+            return content
 
-    # 预览区域
-    if raw_text:
-        st.session_state.raw_text_cache = raw_text # 缓存当前文本
-        with st.expander("👀 预览提取的内容 (点击展开)", expanded=False):
-            st.text(raw_text[:2000] + "...")
+        except Exception as e:
+            error_msg = str(e)
+            # 如果是 429 (速率限制)，动态调整等待时间
+            if "429" in error_msg or "Rate limit" in error_msg:
+                wait_time = base_wait_time * (attempt + 1)  # 动态调整等待时间
+                print(f"Rate limit hit. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue  # 进入下一次循环重试
 
-    # === 生成按钮 (触发后将结果存入 Session State) ===
-    st.markdown("---")
-    btn_disabled = not (raw_text and api_key)
+            # 其他错误直接报错
+            if cfg["type"] == "json":
+                return [{
+                    "Front": "❌ API 调用出错",
+                    "Back": error_msg,
+                    "Tags": ["Error"]
+                }]
+            return f"API Error: {error_msg}"
+
+    # 重试耗尽
+    return [{
+        "Front": "❌ 超时失败",
+        "Back": "重试5次仍被限流，请降低并发数或增加延迟",
+        "Tags": ["Error"]
+    }] if cfg["type"] == "json" else "重试耗尽"
+
+def process_concurrency(text, api_key, base_url, model, cfg, max_workers, delay):
+    """并发控制器，防止 WebSocket 超时"""
+    if cfg["type"] == "text":
+        return call_ai_single(text[:15000], api_key, base_url, model, cfg)
     
-    if st.button("🚀 开始生成卡片", type="primary", use_container_width=True, disabled=btn_disabled):
-        if not api_key:
-            st.error("请先在左侧侧边栏填入 API Key！")
+    chunk_size = 5000
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    all_results = []
+    
+    status_bar = st.progress(0)
+    status_text = st.empty()
+    completed = 0
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交任务时增加间隔，避免瞬间并发过高
+        futures = []
+        for chunk in chunks:
+            futures.append(executor.submit(call_ai_single, chunk, api_key, base_url, model, cfg))
+            time.sleep(delay)  # === 关键：提交任务的间隔 ===
+            
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if isinstance(res, list): all_results.extend(res)
+            completed += 1
+            # 定期更新进度条，防止 WebSocket 超时
+            status_bar.progress(completed / len(chunks))
+            status_text.text(f"已完成: {completed}/{len(chunks)}")
+            time.sleep(0.1)  # 确保界面有时间刷新
+            
+    time.sleep(0.5)
+    status_bar.empty()
+    status_text.empty()
+    return all_results
+
+# === 3. 导出与同步 ===
+def create_pkg(cards, name):
+    if not cards: return None
+    deck = genanki.Deck(random.randrange(1<<30, 1<<31), name)
+    model = genanki.Model(random.randrange(1<<30, 1<<31), 'KM', fields=[{'name':'Q'},{'name':'A'}], 
+                          templates=[{'name':'C1', 'qfmt':'{{Q}}', 'afmt':'{{FrontSide}}<hr>{{A}}'}])
+    for c in cards:
+        tags = c.get('Tags', [])
+        deck.add_note(genanki.Note(model=model, fields=[c.get('Front',''), c.get('Back','')], tags=tags if isinstance(tags, list) else str(tags).split()))
+    path = os.path.join(DATA_DIR, f"{name}.apkg")
+    genanki.Package(deck).write_to_file(path)
+    return path
+
+def push_to_anki(cards, deck_name, note_type, field_front, field_back):
+    url = "http://127.0.0.1:8765"
+    actions = []
+    for card in cards:
+        if "Error" in card.get("Tags", []): continue
+        actions.append({
+            "action": "addNote", "version": 6,
+            "params": {
+                "note": {
+                    "deckName": deck_name, 
+                    "modelName": note_type,
+                    "fields": {field_front: card.get("Front"), field_back: card.get("Back")},
+                    "tags": card.get("Tags", []) if isinstance(card.get("Tags"), list) else str(card.get("Tags")).split(),
+                    "options": {"allowDuplicate": False}
+                }
+            }
+        })
+    try:
+        res = requests.post(url, json={"action": "multi", "version": 6, "params": {"actions": actions}})
+        result = res.json()
+        if result.get("error"): return False, result["error"]
+        return True, len([x for x in result["result"] if x])
+    except Exception as e: return False, str(e)
+
+# === 4. 界面 ===
+with st.sidebar:
+    st.header("KnowledgeMiner V8.3")
+    
+    # API 设置
+    with st.expander("🔌 API 设置", expanded=True):
+        api_key = st.text_input("API Key", value=st.secrets.get("DEFAULT_API_KEY", ""), type="password")
+        base_url = st.text_input("Base URL", value=st.secrets.get("DEFAULT_BASE_URL", "https://api.siliconflow.cn/v1"))
+        model_name = st.text_input("Model", value=st.secrets.get("DEFAULT_MODEL", "deepseek-ai/DeepSeek-V2.5"))
+    
+    # 新增：速率限制设置
+    with st.expander("⚡️ 速率限制 (解决429报错)", expanded=True):
+        st.caption("如果你使用免费 Key 遇到 429 错误，请调低并发，调高延迟。")
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            max_workers = st.number_input("并发线程", min_value=1, max_value=5, value=2, help="同时处理几个片段")
+        with col_s2:
+            request_delay = st.number_input("请求间隔(秒)", min_value=0.0, value=1.0, step=0.5, help="每个请求发出后的等待时间")
+
+    with st.expander("📡 Anki 直连"):
+        anki_note_type = st.text_input("模板名称", value="问答题")
+        anki_field_front = st.text_input("正面字段", value="正面")
+        anki_field_back = st.text_input("背面字段", value="背面")
+
+    with st.expander("🌐 代理设置"):
+        proxy = st.text_input("HTTP Proxy", placeholder="http://127.0.0.1:7890")
+
+    mode = st.selectbox("模式", list(PROMPTS.keys()))
+    if st.button("🗑️ 重置"):
+        for key in list(st.session_state.keys()):
+            if key != 'uploader_key': del st.session_state[key]
+        st.session_state.uploader_key += 1
+        st.rerun()
+
+st.title("KnowledgeMiner")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📝 文本", "🔗 链接", "📄 文档", "🎙️ 音频"])
+curr_text = ""
+
+with tab1:
+    txt_in = st.text_area("粘贴", height=150, key="txt_area") 
+    if txt_in: 
+        curr_text = txt_in
+        if st.session_state.source_name == "未命名笔记": st.session_state.source_name = "剪贴板内容"
+with tab2:
+    url_in = st.text_input("URL", key="url_in")
+    if url_in and st.button("解析"):
+        try:
+            curr_text = extract_youtube(url_in, proxy) if "youtu" in url_in else extract_url(url_in)
+            st.session_state.cached_text = curr_text
+            st.session_state.source_name = "Web_" + url_in.split("/")[-1][:20]
+            st.success("解析成功")
+        except Exception as e: st.error(str(e))
+with tab3:
+    file = st.file_uploader("文件", type=["pdf","epub","txt","md"], key=f"file_{st.session_state.uploader_key}")
+    if file:
+        try:
+            curr_text = extract_file(file)
+            st.session_state.cached_text = curr_text
+            st.session_state.source_name = file.name.rsplit('.', 1)[0]
+        except Exception as e: st.error(str(e))
+with tab4:
+    audio = st.file_uploader("音频", type=["mp3","m4a"], key=f"audio_{st.session_state.uploader_key}")
+    w_key = st.text_input("Whisper Key", type="password")
+    if audio and st.button("转录"):
+        try:
+            curr_text = extract_audio(audio, w_key, "https://api.groq.com/openai/v1")
+            st.session_state.cached_text = curr_text
+            st.session_state.source_name = audio.name.rsplit('.', 1)[0]
+        except Exception as e: st.error(str(e))
+
+if 'cached_text' in st.session_state and not curr_text: curr_text = st.session_state.cached_text
+
+if curr_text:
+    st.info(f"就绪 {len(curr_text)} 字 | 来源: {st.session_state.source_name}")
+    
+    if st.button("🚀 开始处理", type="primary"):
+        if not api_key: st.error("请先在侧边栏填入 API Key")
         else:
-            with st.spinner("🤖 AI 正在大脑风暴中... (通常需要 10-30 秒)"):
-                try:
-                    json_str = generate_cards(raw_text, api_key, base_url, model_name)
-                    json_str = json_str.replace("```json", "").replace("```", "").strip()
-                    data = json.loads(json_str)
-                    
-                    if isinstance(data, dict):
-                        for key in ["cards", "flashcards", "items", "list"]:
-                            if key in data:
-                                data = data[key]
-                                break
-                    if not isinstance(data, list):
-                        data = [data]
+            with st.spinner(f"AI 处理中 (并发:{max_workers}, 延迟:{request_delay}s)..."):
+                cfg = PROMPTS[mode]
+                # 传入用户设置的速率参数
+                res = process_concurrency(curr_text, api_key, base_url, model_name, cfg, max_workers, request_delay)
+                
+                if cfg["type"] == "json":
+                    if isinstance(res, list):
+                        st.session_state.global_cards = res
+                        st.session_state.analysis_result = ""
+                        st.success(f"✅ 生成 {len(res)} 张卡片")
+                    else: st.error(f"失败: {res}")
+                else:
+                    st.session_state.analysis_result = res
+                    st.session_state.global_cards = []
+                    st.success("✅ 分析完成")
 
-                    # 重点：将结果存入 session_state，而不是直接显示
-                    st.session_state.generated_df = pd.DataFrame(data)
-                    
-                except Exception as e:
-                    st.error(f"生成出错: {e}")
-                    with st.expander("查看 AI 原始返回内容 (用于排查)"):
-                        st.code(json_str)
+st.divider()
 
-# === 5. 结果显示区域 (独立于按钮之外) ===
-# 只要 session_state 里有数据，就会一直显示
+if st.session_state.analysis_result:
+    st.subheader("📝 结果")
+    st.code(st.session_state.analysis_result, language="markdown")
+    path = os.path.join(DATA_DIR, f"{st.session_state.source_name}_笔记.md")
+    with open(path, "w", encoding="utf-8") as f: f.write(st.session_state.analysis_result)
+    with open(path, "rb") as f: st.download_button("📥 下载 MD", f, file_name=os.path.basename(path))
 
-with col2:
-    st.subheader("📤 第二步：获取结果")
+elif st.session_state.global_cards:
+    st.subheader(f"📦 卡片 ({len(st.session_state.global_cards)})")
     
-    if st.session_state.generated_df is not None:
-        df = st.session_state.generated_df
-        
-        st.success(f"成功生成 {len(df)} 张卡片！")
-        
-        # 编辑器
-        edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
-        
-        # 导出 CSV
-        csv = edited_df.to_csv(index=False, header=False, sep='\t')
-        
-        st.download_button(
-            label="💾 下载 Anki 导入文件 (.csv)",
-            data=csv,
-            file_name="anki_cards.csv",
-            mime="text/csv",
-            type="primary"
-        )
-        
-        st.markdown("""
-        **💡 如何导入 Anki?**
-        1. 打开电脑版 Anki -> 文件 -> 导入。
-        2. 选择下载的 `.csv` 文件。
-        3. 字段分隔符选择：**Tab (制表符)**。
-        4. 确保 `Allow HTML in fields` (允许在字段中使用 HTML) 已勾选。
-        """)
-    else:
-        if not raw_text:
-             st.info("👈 请先在左侧选择并导入您的素材")
-        else:
-             st.info("👈 素材已就绪，请点击左侧“开始生成”按钮")
+    error_cards = [c for c in st.session_state.global_cards if "Error" in c.get("Tags", [])]
+    if error_cards:
+        st.warning(f"⚠️ 部分片段重试后仍失败 ({len(error_cards)}个)，详情见下方红色卡片")
+        for err in error_cards:
+            st.markdown(f"❌ {err.get('Back')}")
+
+    st.json(st.session_state.global_cards[:2])
+    
+    today_str = datetime.now().strftime("%Y%m%d")
+    default_deck_name = re.sub(r'[\\/*?:"<>|]', "", f"{today_str}_{st.session_state.source_name}")
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        final_deck_name = st.text_input("牌组名称", value=default_deck_name)
+        pkg_path = create_pkg(st.session_state.global_cards, final_deck_name)
+        if pkg_path:
+            with open(pkg_path, "rb") as f:
+                st.download_button("📥 下载 .apkg", f, file_name=os.path.basename(pkg_path), use_container_width=True)
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("📡 直推 Anki", use_container_width=True):
+            success, msg = push_to_anki(st.session_state.global_cards, final_deck_name, anki_note_type, anki_field_front, anki_field_back)
+            if success: st.success(f"✅ 已推送 {msg} 张")
+            else: st.error(f"❌ 失败: {msg}")

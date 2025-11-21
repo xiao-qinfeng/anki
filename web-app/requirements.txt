@@ -1,5 +1,8 @@
 streamlit
 openai
+genanki
+youtube-transcript-api
+pypdf
+ebooklib
+beautifulsoup4
 trafilatura
-pdfplumber
-pandas
